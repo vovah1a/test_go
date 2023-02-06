@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  my-money:
+    build: ./
+    command: ./wait-for-postgres.sh db ./my-money
+    ports:
+      - 8000:8000
+    depends_on:
+      - db
+    environment:
+      - DB_PASSWORD=qwerty
+      - POSTGRES_USER=user
+      - POSTGRES_DB=myMoney
+
+  db:
+    restart: always
+    image: postgres:latest
+    volumes:
+    - ./.database/postgres/data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_PASSWORD=qwerty
+      - POSTGRES_USER=user
+      - POSTGRES_DB=myMoney
+    ports:
+      - 5436:5432
