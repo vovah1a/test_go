@@ -1,4 +1,4 @@
-module myMoney
+module github.com/vovah1a/my-money
 
 go 1.14
 
