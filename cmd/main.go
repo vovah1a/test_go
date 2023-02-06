@@ -2,72 +2,137 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
+	"log"
+	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
 
-	"github.com/joho/godotenv"
-	_ "github.com/lib/pq"
-	"github.com/sirupsen/logrus"
-	"github.com/spf13/viper"
-	"github.com/vovah1a/my-money/pkg/handler"
-	"github.com/vovah1a/my-money/pkg/repository"
-	"github.com/vovah1a/my-money/pkg/service"
+	"github.com/cenkalti/backoff/v4"
+	"github.com/cockroachdb/cockroach-go/v2/crdb"
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
 )
 
 func main() {
-	logrus.SetFormatter(new(logrus.JSONFormatter))
 
-	if err := initConfig(); err != nil {
-		logrus.Fatalf("error initializing configs: %s", err.Error())
-	}
+	e := echo.New()
 
-	if err := godotenv.Load(); err != nil {
-		logrus.Fatalf("error loading env variables: %s", err.Error())
-	}
+	e.Use(middleware.Logger())
+	e.Use(middleware.Recover())
 
-	db, err := repository.NewPostgresDB(repository.Config{
-		Host:     viper.GetString("db.host"),
-		Port:     viper.GetString("db.port"),
-		Username: viper.GetString("db.username"),
-		DBName:   viper.GetString("db.dbname"),
-		SSLMode:  viper.GetString("db.sslmode"),
-		Password: os.Getenv("DB_PASSWORD"),
-	})
+	db, err := initStore()
 	if err != nil {
-		logrus.Fatalf("failed to initialize db: %s", err.Error())
+		log.Fatalf("failed to initialise the store: %s", err)
+	}
+	defer db.Close()
+
+	e.GET("/", func(c echo.Context) error {
+		return rootHandler(db, c)
+	})
+
+	e.GET("/ping", func(c echo.Context) error {
+		return c.JSON(http.StatusOK, struct{ Status string }{Status: "OK"})
+	})
+
+	e.POST("/send", func(c echo.Context) error {
+		return sendHandler(db, c)
+	})
+
+	httpPort := os.Getenv("HTTP_PORT")
+	if httpPort == "" {
+		httpPort = "8080"
 	}
 
-	repos := repository.NewRepository(db)
-	services := service.NewService(repos)
-	handlers := handler.NewHandler(services)
-
-	srv := new(myMoney.Server)
-	go func() {
-		if err := srv.Run(viper.GetString("port"), handlers.InitRoutes()); err != nil {
-			logrus.Fatalf("error occured while running http server: %s", err.Error())
-		}
-	}()
-
-	logrus.Print("MyMoneyApp Started")
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
-	<-quit
-
-	logrus.Print("MyMoneyApp Shutting Down")
-
-	if err := srv.Shutdown(context.Background()); err != nil {
-		logrus.Errorf("error occured on server shutting down: %s", err.Error())
-	}
-
-	if err := db.Close(); err != nil {
-		logrus.Errorf("error occured on db connection close: %s", err.Error())
-	}
+	e.Logger.Fatal(e.Start(":" + httpPort))
 }
 
-func initConfig() error {
-	viper.AddConfigPath("configs")
-	viper.SetConfigName("config")
-	return viper.ReadInConfig()
+type Message struct {
+	Value string `json:"value"`
+}
+
+func initStore() (*sql.DB, error) {
+
+	pgConnString := fmt.Sprintf("host=%s port=%s dbname=%s user=%s password=%s sslmode=disable",
+		os.Getenv("PGHOST"),
+		os.Getenv("PGPORT"),
+		os.Getenv("PGDATABASE"),
+		os.Getenv("PGUSER"),
+		os.Getenv("PGPASSWORD"),
+	)
+
+	var (
+		db  *sql.DB
+		err error
+	)
+	openDB := func() error {
+		db, err = sql.Open("postgres", pgConnString)
+		return err
+	}
+
+	err = backoff.Retry(openDB, backoff.NewExponentialBackOff())
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := db.Exec(
+		"CREATE TABLE IF NOT EXISTS message (value STRING PRIMARY KEY)"); err != nil {
+		return nil, err
+	}
+
+	return db, nil
+}
+
+func rootHandler(db *sql.DB, c echo.Context) error {
+	r, err := countRecords(db)
+	if err != nil {
+		return c.HTML(http.StatusInternalServerError, err.Error())
+	}
+	return c.HTML(http.StatusOK, fmt.Sprintf("Hello, Docker! (%d)\n", r))
+}
+
+func sendHandler(db *sql.DB, c echo.Context) error {
+
+	m := &Message{}
+
+	if err := c.Bind(m); err != nil {
+		return c.JSON(http.StatusInternalServerError, err)
+	}
+
+	err := crdb.ExecuteTx(context.Background(), db, nil,
+		func(tx *sql.Tx) error {
+			_, err := tx.Exec(
+				"INSERT INTO message (value) VALUES ($1) ON CONFLICT (value) DO UPDATE SET value = excluded.value",
+				m.Value,
+			)
+			if err != nil {
+				return c.JSON(http.StatusInternalServerError, err)
+			}
+			return nil
+		})
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, err)
+	}
+
+	return c.JSON(http.StatusOK, m)
+}
+
+func countRecords(db *sql.DB) (int, error) {
+
+	rows, err := db.Query("SELECT COUNT(*) FROM message")
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	count := 0
+	for rows.Next() {
+		if err := rows.Scan(&count); err != nil {
+			return 0, err
+		}
+		rows.Close()
+	}
+
+	return count, nil
 }
